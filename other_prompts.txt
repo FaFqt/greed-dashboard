@@ -1,0 +1,14 @@
+Start:
+Adventurer wakes up confused and slowly stands up in front of the portal
+
+Exploring:
+Make the portal swirl, indicating something is about to come out of it. It has to be loopable, so I can use it as an intro before transitioning to another video.
+
+Death:
+The adventurer, tired and bruised, slowly falls to their knees, then lies down and succumbs to their injuries and dies.
+
+Potion:
+A healing potion flies out of the portal and the adventurer catches it, then proceeds to drink it
+
+Gold:
+Make a small pouch fly out of the portal and land next to the character. It should not fly around the room first, but just pop out of the portal and land
