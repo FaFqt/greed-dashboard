@@ -270,7 +270,7 @@ export default function GreedDashboardPage() {
               <Typography sx={styles.eyebrow}>Death Mountain</Typography>
               <Typography sx={styles.title}>Greed Dashboard</Typography>
               <Typography sx={styles.subtitle}>
-                Track Greed runs, wallet-realized P&amp;L, leaderboard momentum
+                Track Greed runs, realized wallet P&amp;L, and leaderboard momentum.
               </Typography>
             </Box>
 

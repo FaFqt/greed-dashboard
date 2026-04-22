@@ -48,7 +48,7 @@ function DungeonRoute({ children }: { children: ReactNode }) {
 export const desktopRoutes = [
   {
     path: '/',
-    content: <Navigate to="/survivor" replace />,
+    content: <Navigate to="/greed" replace />,
   },
   {
     path: "/greed",
@@ -87,7 +87,7 @@ export const desktopRoutes = [
 export const mobileRoutes = [
   {
     path: '/',
-    content: <Navigate to="/survivor" replace />,
+    content: <Navigate to="/greed" replace />,
   },
   {
     path: "/greed",

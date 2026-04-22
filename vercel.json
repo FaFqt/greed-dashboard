@@ -1,4 +1,11 @@
 {
+    "redirects": [
+        {
+            "source": "/",
+            "destination": "/greed",
+            "permanent": false
+        }
+    ],
     "rewrites": [
         {
             "source": "/(.*)",
