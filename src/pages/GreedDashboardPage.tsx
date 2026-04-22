@@ -1,6 +1,6 @@
 import { useController } from "@/contexts/controller";
 import { NETWORKS } from "@/utils/networkConfig";
-import { ellipseAddress, formatAmount } from "@/utils/utils";
+import { decodeHexByteArray, ellipseAddress, formatAmount } from "@/utils/utils";
 import LaunchIcon from "@mui/icons-material/Launch";
 import LeaderboardIcon from "@mui/icons-material/Leaderboard";
 import ShowChartIcon from "@mui/icons-material/ShowChart";
@@ -30,6 +30,26 @@ import { useNavigate } from "react-router-dom";
 
 type ToriiRow = Record<string, string>;
 
+interface RpcCall {
+  contract_address: string;
+  entry_point_selector: string;
+  calldata: string[];
+}
+
+interface AdventurerRun {
+  tokenId: string;
+  score: number;
+  level: number;
+  playerName: string;
+  settingsId: number;
+  gameOver: boolean;
+  expired: boolean;
+  mintedTime: number | null;
+  startTime: number | null;
+  endTime: number | null;
+  clientUrl: string | null;
+}
+
 interface TimelinePoint {
   amount: number;
   cumulative: number;
@@ -47,7 +67,19 @@ const SURVIVOR_TOKEN = addAddressPadding(
   NETWORKS.SN_MAIN.paymentTokens.find((token) => token.name === "SURVIVOR")
     ?.address || ""
 );
+const GAMES_COLLECTION_CONTRACT = addAddressPadding(
+  "0x00263cc540dac11334470a64759e03952ee2f84a290e99ba8cbc391245cd0bf9"
+);
 const GREED_SETTINGS_ID = 1;
+const BALANCE_OF_SELECTOR =
+  "0x35a73cd311a05d46deda634c5ee045db92f811b4e74bca4437fcb5302b7af33";
+const TOKEN_OF_OWNER_BY_INDEX_SELECTOR =
+  "0x3f2387c5fc10a274c9063decad17252bdc446229607c764d106638ff3cdedd5";
+const TOKEN_URI_SELECTOR =
+  "0x226ad7e84c1fe08eb4c525ed93cccadf9517670341304571e66f7c4f95cbe54";
+const MAX_GREED_RUNS = 25;
+const MAX_COLLECTION_TOKENS_TO_SCAN = 120;
+const OWNER_SCAN_BATCH_SIZE = 8;
 
 function toTokenAmount(raw: string, decimals: number = 18) {
   const value = BigInt(raw || "0x0");
@@ -56,6 +88,142 @@ function toTokenAmount(raw: string, decimals: number = 18) {
   const fractionBase = 10n ** BigInt(Math.max(decimals - 4, 0));
   const fraction = Number((value % base) / fractionBase) / 1e4;
   return whole + fraction;
+}
+
+function uint256ToBigInt(low: string, high: string) {
+  return BigInt(low) + (BigInt(high) << 128n);
+}
+
+function traitValue(
+  attributes: Array<{ trait?: string; value?: string }>,
+  traitName: string
+) {
+  return attributes.find((attribute) => attribute.trait === traitName)?.value;
+}
+
+async function rpcBatch(calls: RpcCall[]) {
+  const payload = calls.map((call, index) => ({
+    jsonrpc: "2.0",
+    id: index,
+    method: "starknet_call",
+    params: [call, "latest"],
+  }));
+
+  const response = await fetch(NETWORKS.SN_MAIN.rpcUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    throw new Error(`RPC batch failed: ${response.status}`);
+  }
+
+  const result = await response.json();
+  return Array.isArray(result) ? result : [result];
+}
+
+async function rpcCall(call: RpcCall) {
+  const [result] = await rpcBatch([call]);
+  if (result.error) {
+    throw new Error(result.error.message || "RPC call failed");
+  }
+  return result.result as string[];
+}
+
+function decodeMetadataFromTokenUri(result: string[]) {
+  const decoded = decodeHexByteArray(result);
+  const base64 = decoded.replace("data:application/json;base64,", "");
+  const metadataJson = atob(base64);
+  return JSON.parse(metadataJson) as {
+    attributes?: Array<{ trait?: string; value?: string }>;
+  };
+}
+
+async function fetchGreedRunsForWallet(ownerAddress: string) {
+  const balanceResult = await rpcCall({
+    contract_address: GAMES_COLLECTION_CONTRACT,
+    entry_point_selector: BALANCE_OF_SELECTOR,
+    calldata: [ownerAddress],
+  });
+
+  const totalBalance = Number(uint256ToBigInt(balanceResult[0] || "0x0", balanceResult[1] || "0x0"));
+  const runs: AdventurerRun[] = [];
+
+  for (
+    let currentIndex = totalBalance - 1;
+    currentIndex >= 0 &&
+    runs.length < MAX_GREED_RUNS &&
+    totalBalance - 1 - currentIndex < MAX_COLLECTION_TOKENS_TO_SCAN;
+    currentIndex -= OWNER_SCAN_BATCH_SIZE
+  ) {
+    const indexes = Array.from({ length: OWNER_SCAN_BATCH_SIZE }, (_, offset) => currentIndex - offset)
+      .filter((index) => index >= 0);
+
+    const tokenIdResponses = await rpcBatch(
+      indexes.map((index) => ({
+        contract_address: GAMES_COLLECTION_CONTRACT,
+        entry_point_selector: TOKEN_OF_OWNER_BY_INDEX_SELECTOR,
+        calldata: [ownerAddress, `0x${index.toString(16)}`, "0x0"],
+      }))
+    );
+
+    const tokenCalls = tokenIdResponses
+      .filter((response) => !response.error && response.result?.length >= 2)
+      .map((response) => ({
+        low: response.result[0] as string,
+        high: response.result[1] as string,
+      }));
+
+    const metadataResponses = await rpcBatch(
+      tokenCalls.map((token) => ({
+        contract_address: GAMES_COLLECTION_CONTRACT,
+        entry_point_selector: TOKEN_URI_SELECTOR,
+        calldata: [token.low, token.high],
+      }))
+    );
+
+    metadataResponses.forEach((response, index) => {
+      if (response.error || !response.result) {
+        return;
+      }
+
+      try {
+        const metadata = decodeMetadataFromTokenUri(response.result as string[]);
+        const attributes = metadata.attributes || [];
+        const settingsId = Number(traitValue(attributes, "Settings ID") || -1);
+
+        if (settingsId !== GREED_SETTINGS_ID) {
+          return;
+        }
+
+        const token = tokenCalls[index];
+        const tokenId = uint256ToBigInt(token.low, token.high).toString();
+
+        runs.push({
+          tokenId,
+          score: Number(traitValue(attributes, "Score") || traitValue(attributes, "XP") || 0),
+          level: Number(traitValue(attributes, "Level") || 0),
+          playerName: traitValue(attributes, "Player Name") || "Adventurer",
+          settingsId,
+          gameOver: (traitValue(attributes, "Game Over") || "").toLowerCase() === "true",
+          expired: (traitValue(attributes, "Expired") || "").toLowerCase() === "true",
+          mintedTime: Number(traitValue(attributes, "Minted Time") || 0) || null,
+          startTime: Number(traitValue(attributes, "Start Time") || 0) || null,
+          endTime: Number(traitValue(attributes, "End Time") || 0) || null,
+          clientUrl: traitValue(attributes, "Client URL") || null,
+        });
+      } catch (error) {
+        console.error("Failed to decode Games Collection metadata", error);
+      }
+    });
+  }
+
+  return runs
+    .sort((left, right) => (right.mintedTime || 0) - (left.mintedTime || 0))
+    .slice(0, MAX_GREED_RUNS);
 }
 
 async function queryToriiSql(query: string) {
@@ -143,19 +311,12 @@ export default function GreedDashboardPage() {
   const [timeline, setTimeline] = useState<TimelinePoint[]>([]);
   const [timelineLoading, setTimelineLoading] = useState(false);
   const [timelineError, setTimelineError] = useState<string | null>(null);
+  const [ownedGreedRuns, setOwnedGreedRuns] = useState<AdventurerRun[]>([]);
+  const [ownedGreedRunsLoading, setOwnedGreedRunsLoading] = useState(false);
+  const [ownedGreedRunsError, setOwnedGreedRunsError] = useState<string | null>(null);
 
   const leaderboard = useGameTokens({
     limit: 10,
-    sortBy: "score",
-    sortOrder: "desc",
-    mintedByAddress: GREED_CONTRACT,
-    gameAddresses: [NETWORKS.SN_MAIN.gameAddress],
-    settings_id: GREED_SETTINGS_ID,
-  });
-
-  const myGames = useGameTokens({
-    owner: address,
-    limit: 25,
     sortBy: "score",
     sortOrder: "desc",
     mintedByAddress: GREED_CONTRACT,
@@ -245,6 +406,44 @@ export default function GreedDashboardPage() {
     };
   }, [address]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadOwnedGreedRuns() {
+      if (!address) {
+        setOwnedGreedRuns([]);
+        setOwnedGreedRunsError(null);
+        return;
+      }
+
+      try {
+        setOwnedGreedRunsLoading(true);
+        setOwnedGreedRunsError(null);
+
+        const runs = await fetchGreedRunsForWallet(addAddressPadding(address));
+        if (!cancelled) {
+          setOwnedGreedRuns(runs);
+        }
+      } catch (error) {
+        console.error(error);
+        if (!cancelled) {
+          setOwnedGreedRuns([]);
+          setOwnedGreedRunsError("Unable to load Greed runs from the Games Collection contract.");
+        }
+      } finally {
+        if (!cancelled) {
+          setOwnedGreedRunsLoading(false);
+        }
+      }
+    }
+
+    loadOwnedGreedRuns();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [address]);
+
   const totalStaked = timeline
     .filter((point) => point.amount < 0)
     .reduce((sum, point) => sum + Math.abs(point.amount), 0);
@@ -253,11 +452,11 @@ export default function GreedDashboardPage() {
     .reduce((sum, point) => sum + point.amount, 0);
   const realizedNet = timeline.length > 0 ? timeline[timeline.length - 1].cumulative : 0;
   const realizedRoi = totalStaked > 0 ? (realizedNet / totalStaked) * 100 : 0;
-  const myBestScore = Math.max(...((myGames.games || []).map((game: any) => game.score || 0)), 0);
+  const myBestScore = Math.max(...ownedGreedRuns.map((game) => game.score || 0), 0);
   const averageScore =
-    (myGames.games || []).length > 0
-      ? (myGames.games || []).reduce((sum: number, game: any) => sum + (game.score || 0), 0) /
-        myGames.games.length
+    ownedGreedRuns.length > 0
+      ? ownedGreedRuns.reduce((sum, game) => sum + (game.score || 0), 0) /
+        ownedGreedRuns.length
       : 0;
 
   return (
@@ -409,13 +608,13 @@ export default function GreedDashboardPage() {
           <Box sx={styles.contentGrid}>
             <SectionCard
               title="My Greed Runs"
-              subtitle="Connected wallet run history"
+              subtitle="Greed runs owned through the Games Collection contract"
               icon={<SportsEsportsIcon />}
             >
               <Box sx={styles.runStatsRow}>
                 <Box sx={styles.runStat}>
                   <Typography sx={styles.runStatLabel}>Runs</Typography>
-                  <Typography sx={styles.runStatValue}>{(myGames.games || []).length}</Typography>
+                  <Typography sx={styles.runStatValue}>{ownedGreedRuns.length}</Typography>
                 </Box>
                 <Box sx={styles.runStat}>
                   <Typography sx={styles.runStatLabel}>Best Score</Typography>
@@ -429,55 +628,69 @@ export default function GreedDashboardPage() {
 
               {!address ? (
                 <Box sx={styles.emptyState}>
-                  <Typography sx={styles.emptyTitle}>Personal history is wallet-based</Typography>
+                  <Typography sx={styles.emptyTitle}>Personal history is collection-based</Typography>
                   <Typography sx={styles.emptyBody}>
-                    Connect your Cartridge wallet to load your indexed Greed runs and
-                    watch replays from here.
+                    Connect your Cartridge wallet to load the Greed run NFTs held by
+                    the Games Collection contract.
                   </Typography>
                 </Box>
-              ) : myGames.loading ? (
+              ) : ownedGreedRunsLoading ? (
                 <Box sx={styles.loaderState}>
                   <CircularProgress size={24} color="secondary" />
                 </Box>
-              ) : (myGames.games || []).length === 0 ? (
+              ) : ownedGreedRuns.length === 0 ? (
                 <Box sx={styles.emptyState}>
                   <Typography sx={styles.emptyTitle}>No Greed runs found</Typography>
                   <Typography sx={styles.emptyBody}>
-                    This wallet does not have indexed Greed runs yet.
+                    This wallet does not currently hold Greed run NFTs from the Games
+                    Collection contract.
                   </Typography>
                 </Box>
               ) : (
                 <Box sx={styles.list}>
-                  {(myGames.games || []).map((game: any) => (
-                    <Box key={game.token_id} sx={styles.listRow}>
+                  {ownedGreedRuns.map((game) => (
+                    <Box key={game.tokenId} sx={styles.listRow}>
                       <Box>
                         <Typography sx={styles.listTitle}>
-                          {game.player_name || "Adventurer"}
+                          {game.playerName}
                         </Typography>
-                        <Typography sx={styles.listMeta}>Run #{game.token_id}</Typography>
+                        <Typography sx={styles.listMeta}>Run #{game.tokenId}</Typography>
                       </Box>
 
                       <Box sx={styles.rowRight}>
                         <Box sx={{ textAlign: "right" }}>
                           <Typography sx={styles.listScore}>{game.score || 0} XP</Typography>
                           <Typography sx={styles.listMeta}>
-                            {game.game_over ? "Completed" : "Active / claimable"}
+                            {game.gameOver || game.expired
+                              ? "Completed"
+                              : "Active / claimable"}
                           </Typography>
                         </Box>
                         <Button
                           size="small"
                           variant="outlined"
                           startIcon={<VisibilityIcon />}
-                          onClick={() => navigate(`/greed/watch?id=${game.token_id}`)}
+                          onClick={() => {
+                            if (game.clientUrl) {
+                              window.open(`${game.clientUrl}${game.tokenId}`, "_blank");
+                              return;
+                            }
+
+                            navigate(`/greed/watch?id=${game.tokenId}`);
+                          }}
                           sx={styles.watchButton}
                         >
-                          Watch
+                          Open
                         </Button>
                       </Box>
                     </Box>
                   ))}
                 </Box>
               )}
+
+              {ownedGreedRunsError ? (
+                <Typography sx={styles.errorText}>{ownedGreedRunsError}</Typography>
+              ) : null}
             </SectionCard>
 
             <SectionCard
